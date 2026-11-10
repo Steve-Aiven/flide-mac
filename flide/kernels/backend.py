@@ -1,4 +1,4 @@
-"""Which kernel path to use: Triton (CUDA) or eager PyTorch (MPS/CPU)."""
+"""Which kernel path to use: Triton (CUDA), Metal (MPS), or eager PyTorch."""
 from __future__ import annotations
 
 _TRITON = None
@@ -16,13 +16,30 @@ def triton_available() -> bool:
     return _TRITON
 
 
+def _kind(device) -> str | None:
+    if device is None:
+        return None
+    import torch
+
+    return device.type if isinstance(device, torch.device) else str(device).split(":", 1)[0]
+
+
 def use_triton(device=None) -> bool:
     """Triton kernels only on CUDA devices when Triton imports."""
     if not triton_available():
         return False
-    if device is None:
-        return True
-    import torch
+    kind = _kind(device)
+    return kind is None or kind == "cuda"
 
-    kind = device.type if isinstance(device, torch.device) else str(device).split(":", 1)[0]
-    return kind == "cuda"
+
+def use_metal(device=None) -> bool:
+    """Metal shaders on MPS when torch.mps.compile_shader is available."""
+    kind = _kind(device)
+    if kind is not None and kind != "mps":
+        return False
+    try:
+        from .metal.runtime import metal_available
+
+        return metal_available()
+    except Exception:
+        return False

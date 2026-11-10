@@ -196,25 +196,30 @@ def attention(q, k1, v1, k2, v2, q_meta, k1_meta, k2_meta, ranges, scale: float,
     # Prefer exact per-query ranges when provided (packed fork path).
     if qranges is not None:
         lo1, hi1, lo2, hi2 = qranges.long()
-        acc = torch.zeros(Tq, H, D, device=q.device, dtype=torch.float32)
-        for t in range(Tq):
-            parts_k, parts_v = [], []
-            a, b = int(lo1[t]), int(hi1[t])
-            if b > a:
-                parts_k.append(k1e[a:b])
-                parts_v.append(v1e[a:b])
-            c, d_ = int(lo2[t]), int(hi2[t])
-            if d_ > c:
-                parts_k.append(k2e[c:d_])
-                parts_v.append(v2e[c:d_])
-            if not parts_k:
-                continue
-            kk = torch.cat(parts_k, 0)
-            vv = torch.cat(parts_v, 0)
-            s = torch.einsum("hd,khd->hk", q[t].float(), kk.float()) * scale
-            p = torch.softmax(s, -1)
-            acc[t] = torch.einsum("hk,khd->hd", p, vv.float())
-        out.copy_(acc.to(q.dtype))
+        same = k1.data_ptr() == k2.data_ptr() and v1.data_ptr() == v2.data_ptr()
+        if same:
+            kk, vv = k1e, v1e
+            Tk = kk.shape[0]
+            idx = torch.arange(Tk, device=q.device)
+            mask = ((idx[None, :] >= lo1[:, None]) & (idx[None, :] < hi1[:, None])) | (
+                (idx[None, :] >= lo2[:, None]) & (idx[None, :] < hi2[:, None]))
+        else:
+            Tk1, Tk2 = k1e.shape[0], k2e.shape[0]
+            kk = torch.cat([k1e, k2e], 0)
+            vv = torch.cat([v1e, v2e], 0)
+            idx1 = torch.arange(Tk1, device=q.device)
+            idx2 = torch.arange(Tk2, device=q.device)
+            m1 = (idx1[None, :] >= lo1[:, None]) & (idx1[None, :] < hi1[:, None])
+            m2 = (idx2[None, :] >= lo2[:, None]) & (idx2[None, :] < hi2[:, None])
+            mask = torch.cat([m1, m2], 1)
+        # [1, H, Tq, D] SDPA with bool mask (True = keep).
+        qh = q.transpose(0, 1).unsqueeze(0)
+        kh = kk.transpose(0, 1).unsqueeze(0)
+        vh = vv.transpose(0, 1).unsqueeze(0)
+        # Broadcast mask to [1, 1, Tq, Tk]
+        attn_mask = mask.unsqueeze(0).unsqueeze(0)
+        y = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=attn_mask, scale=scale)
+        out.copy_(y.squeeze(0).transpose(0, 1).contiguous().to(q.dtype))
         return out
 
     qj, qb, qp = (x.long() for x in q_meta[:3])

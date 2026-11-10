@@ -42,10 +42,30 @@ def test_eager_gdn_shapes():
     assert st is not None and st.shape[0] == 1
 
 
+def test_qranges_attention_matches_loop():
+    torch.manual_seed(0)
+    Tq, H, Hk, D = 5, 4, 2, 8
+    q = torch.randn(Tq, H, D)
+    k = torch.randn(Tq, Hk, D)
+    v = torch.randn(Tq, Hk, D)
+    meta = (torch.zeros(Tq, dtype=torch.int32), torch.full((Tq,), -1, dtype=torch.int32),
+            torch.arange(Tq, dtype=torch.int32))
+    lo1 = torch.zeros(Tq, dtype=torch.int32)
+    hi1 = torch.arange(1, Tq + 1, dtype=torch.int32)
+    lo2 = torch.zeros(Tq, dtype=torch.int32)
+    hi2 = torch.zeros(Tq, dtype=torch.int32)
+    qranges = torch.stack([lo1, hi1, lo2, hi2])
+    R = torch.zeros(1, 10, dtype=torch.int32)
+    y = eager.attention(q, k, v, k, v, meta, meta, meta, R, scale=D ** -0.5, qranges=qranges)
+    assert y.shape == (Tq, H, D)
+    assert torch.isfinite(y).all()
+
+
 def main():
     test_resolve_auto_prefers_available_backend()
     test_pointwise_rms_swiglu()
     test_eager_gdn_shapes()
+    test_qranges_attention_matches_loop()
     print("ok")
 
 

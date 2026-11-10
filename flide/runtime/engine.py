@@ -125,7 +125,10 @@ class Engine:
                          "start on this machine takes a few minutes and later ones read them from the cache",
                          missing, cache_dir())
         else:
-            log.info("using eager PyTorch kernels on %s (no Triton/CUDA graphs)", device)
+            from ..kernels.backend import use_metal as _use_metal
+
+            path = "Metal" if _use_metal(device) else "eager PyTorch"
+            log.info("using %s kernels on %s (no Triton/CUDA graphs)", path, device)
 
             def tune():
                 return None

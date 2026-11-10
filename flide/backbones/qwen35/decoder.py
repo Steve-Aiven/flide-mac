@@ -45,12 +45,18 @@ def _pin_fla():
 
 
 def _gdn_ops(device):
-    """FLA (CUDA/Triton) or eager PyTorch (MPS/CPU) for causal_conv1d and chunk_gated_delta_rule."""
+    """FLA (CUDA/Triton), Metal (MPS), or eager PyTorch for causal_conv1d and chunk_gated_delta_rule."""
     if use_triton(device):
         from fla.modules.convolution import causal_conv1d
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
         return causal_conv1d, chunk_gated_delta_rule
+    from ...kernels.backend import use_metal
+
+    if use_metal(device):
+        from ...kernels import metal
+
+        return metal.causal_conv1d, metal.chunk_gated_delta_rule
     from ...kernels import eager
 
     return eager.causal_conv1d, eager.chunk_gated_delta_rule

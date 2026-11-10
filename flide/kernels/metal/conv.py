@@ -21,39 +21,87 @@ def causal_conv1d(x, weight, bias=None, activation=None, initial_state=None, out
         return eager.causal_conv1d(x, weight, bias, activation, initial_state, output_final_state,
                                    cu_seqlens, cu_seqlens_cpu)
 
-    x = x[0]  # [T, C]
+    x_tc = x[0]  # [T, C]
     w = weight.squeeze(1) if weight.dim() == 3 else weight
     W = int(w.shape[-1])
-    pad = W - 1
-    C = x.shape[1]
-    cu = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens
-    if cu is None:
-        cu = [0, x.shape[0]]
-    else:
-        cu = cu.tolist() if hasattr(cu, "tolist") else list(cu)
+    if W > 16:
+        from .. import eager
 
+        return eager.causal_conv1d(x, weight, bias, activation, initial_state, output_final_state,
+                                   cu_seqlens, cu_seqlens_cpu)
+
+    pad = W - 1
+    T, C = x_tc.shape
+    cu_src = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens
+    if cu_src is None:
+        bounds = [0, T]
+        N = 1
+    else:
+        bounds = cu_src.tolist() if hasattr(cu_src, "tolist") else list(cu_src)
+        N = len(bounds) - 1
+
+    # Prefer the single-launch varlen kernel for float16 (decoder hot path).
+    if x_tc.dtype == torch.float16:
+        return _varlen_f16(x_tc, w, bias, activation, initial_state, output_final_state, bounds, N, C, W, pad)
+
+    # Float32 / other: keep the existing per-segment fwd path.
+    return _per_segment(x_tc, w, bias, activation, initial_state, output_final_state, bounds, C, pad)
+
+
+def _varlen_f16(x_tc, w, bias, activation, initial_state, output_final_state, bounds, N, C, W, pad):
+    device = x_tc.device
+    T = x_tc.shape[0]
+    cu = torch.tensor(bounds, device=device, dtype=torch.int32)
+    out = torch.empty_like(x_tc)
+    wt = w.contiguous().half()
+    has_bias = bias is not None
+    bias_t = bias.contiguous().half() if has_bias else torch.zeros(C, device=device, dtype=torch.float16)
+    apply_silu = 1 if activation in ("silu", "swish") else 0
+    has_init = initial_state is not None and pad > 0
+    if has_init:
+        init = initial_state.contiguous().half()
+    else:
+        init = torch.zeros(N, C, max(pad, 1), device=device, dtype=torch.float16)
+    write_state = bool(output_final_state and pad > 0)
+    if write_state:
+        out_state = torch.empty(N, C, pad, device=device, dtype=torch.float16)
+    else:
+        out_state = torch.empty(N, C, max(pad, 1), device=device, dtype=torch.float16)
+
+    kn = shader_lib().causal_conv1d_varlen_f16
+    tg = min(256, max(C, 1))
+    kn(x_tc.contiguous(), wt, bias_t, cu, init, out, out_state,
+       N, C, W, int(has_bias), apply_silu, int(has_init), int(write_state),
+       threads=[C, N, 1], group_size=[tg, 1, 1])
+    return out.unsqueeze(0), (out_state if write_state else None)
+
+
+def _per_segment(x, w, bias, activation, initial_state, output_final_state, bounds, C, pad):
     outs, states = [], []
-    for i in range(len(cu) - 1):
-        a, b = int(cu[i]), int(cu[i + 1])
+    for i in range(len(bounds) - 1):
+        a, b = int(bounds[i]), int(bounds[i + 1])
         seg = x[a:b]
         if seg.shape[0] == 0:
             outs.append(seg)
             if output_final_state:
                 states.append(torch.zeros(C, pad, device=x.device, dtype=x.dtype) if pad else None)
             continue
-        init = initial_state[i] if initial_state is not None else None  # [C, W-1]
+        init = initial_state[i] if initial_state is not None else None
         if init is not None and pad:
-            stream = torch.cat([init.transpose(0, 1).contiguous(), seg], 0)  # [pad+L, C]
+            stream = torch.cat([init.transpose(0, 1).contiguous(), seg], 0)
             y_full = _fwd_btc(stream.unsqueeze(0), w, bias, activation)[0]
             yi = y_full[pad:]
             st = stream[-pad:].transpose(0, 1).contiguous() if output_final_state else None
         else:
             yi = _fwd_btc(seg.unsqueeze(0), w, bias, activation)[0]
-            st = (seg[-pad:].transpose(0, 1).contiguous() if (output_final_state and pad and seg.shape[0] >= pad)
-                  else (torch.zeros(C, pad, device=x.device, dtype=x.dtype) if output_final_state and pad else None))
-            if output_final_state and pad and 0 < seg.shape[0] < pad:
-                st = torch.zeros(C, pad, device=x.device, dtype=x.dtype)
-                st[:, -seg.shape[0]:] = seg.transpose(0, 1)
+            if output_final_state and pad:
+                if seg.shape[0] >= pad:
+                    st = seg[-pad:].transpose(0, 1).contiguous()
+                else:
+                    st = torch.zeros(C, pad, device=x.device, dtype=x.dtype)
+                    st[:, -seg.shape[0]:] = seg.transpose(0, 1)
+            else:
+                st = None
         outs.append(yi)
         if output_final_state:
             states.append(st)

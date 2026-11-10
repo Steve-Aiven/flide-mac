@@ -63,49 +63,33 @@ def chunk_gated_delta_rule(q, k, v, g=None, beta=None, initial_state=None, outpu
         dt = g_t if dt_bias is None else g_t + dt_bias.float().repeat_interleave(group, 0)[:Hv]
         g_t = -a.exp() * F.softplus(dt)
 
-    cu = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens
-    bounds = [0, T] if cu is None else (cu.tolist() if hasattr(cu, "tolist") else list(cu))
+    cu_src = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens
+    bounds = [0, T] if cu_src is None else (cu_src.tolist() if hasattr(cu_src, "tolist") else list(cu_src))
+    N = len(bounds) - 1
 
-    outs, final_states = [], []
-    for si in range(len(bounds) - 1):
-        a, b = int(bounds[si]), int(bounds[si + 1])
-        L = b - a
-        if L <= 0:
-            outs.append(q.new_zeros(0, Hv, Dv))
-            if output_final_state:
-                final_states.append(
-                    initial_state[si].float().clone() if initial_state is not None
-                    else torch.zeros(Hv, Dv, Dk, device=device, dtype=torch.float32))
-            continue
+    # Packed layouts for the varlen kernel: [T, H, K/V], g/beta [T, H], state [N, H, V, K].
+    qh = q0.contiguous().half()
+    kh = k0.contiguous().half()
+    vh = v0.contiguous().half()
+    gh = g_t.contiguous().float()
+    bh = beta_t.contiguous().half()
+    cu = torch.tensor(bounds, device=device, dtype=torch.int32)
 
-        if initial_state is not None:
-            S = initial_state[si].float().clone()  # [Hv, Dv, Dk]
-        else:
-            S = torch.zeros(Hv, Dv, Dk, device=device, dtype=torch.float32)
+    if initial_state is not None:
+        st = initial_state.float().clone().contiguous()
+    else:
+        st = torch.zeros(N, Hv, Dv, Dk, device=device, dtype=torch.float32)
+    out = torch.empty(T, Hv, Dv, device=device, dtype=torch.float16)
 
-        # Metal layout: q/k/v/g/beta as [1, H, T, ...]
-        qh = q0[a:b].transpose(0, 1).contiguous().unsqueeze(0).half()  # [1, H, L, K]
-        kh = k0[a:b].transpose(0, 1).contiguous().unsqueeze(0).half()
-        vh = v0[a:b].transpose(0, 1).contiguous().unsqueeze(0).half()
-        gh = g_t[a:b].transpose(0, 1).contiguous().unsqueeze(0).float()  # [1, H, L]
-        bh = beta_t[a:b].transpose(0, 1).contiguous().unsqueeze(0).half()
-        # state [1, H, V, K]
-        st = S.unsqueeze(0).contiguous()
-        out_h = torch.empty(1, Hv, L, Dv, device=device, dtype=torch.float16)
+    lib = shader_lib()
+    tg = min(256, max(Dv, 1))
+    # One threadgroup per (head, segment).
+    lib.gdn_recurrent_varlen(
+        qh, kh, vh, gh, bh, cu, st, out,
+        N, Hv, Dk, Dv,
+        threads=[Hv * tg, N, 1], group_size=[tg, 1, 1],
+    )
 
-        lib = shader_lib()
-        tg = min(256, max(Dv, 1))
-        # One threadgroup per head; B=1
-        lib.gdn_recurrent_fused(
-            qh, kh, vh, gh, bh, st, out_h,
-            1, Hv, L, Dk, Dv,
-            threads=[Hv * tg, 1, 1], group_size=[tg, 1, 1],
-        )
-        # out_h [1, H, L, V] -> [L, H, V]
-        outs.append(out_h[0].transpose(0, 1).contiguous().to(v.dtype))
-        if output_final_state:
-            final_states.append(st[0].contiguous())
-
-    o = torch.cat(outs, 0).unsqueeze(0)
-    state = torch.stack(final_states, 0) if output_final_state else None
+    o = out.unsqueeze(0).to(v.dtype)
+    state = st if output_final_state else None
     return o, state

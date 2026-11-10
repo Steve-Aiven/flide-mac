@@ -132,9 +132,9 @@ class Batcher:
         return items
 
     def _loop(self):
-        import torch
+        from .device import set_device
 
-        torch.cuda.set_device(self.engine.backbone.device)
+        set_device(self.engine.backbone.device)
         inflight = None
         while True:
             if inflight is not None and self._carry is None and self.q.empty():

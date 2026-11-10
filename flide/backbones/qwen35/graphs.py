@@ -83,10 +83,13 @@ def _causal(q, k, v, scale: float):
     import torch.nn.functional as F
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
+    heads = lambda x: x.transpose(0, 1)[None]
+    if q.device.type != "cuda":
+        o = F.scaled_dot_product_attention(heads(q), heads(k), heads(v), is_causal=True, scale=scale, enable_gqa=True)
+        return o[0].transpose(0, 1)
     order = [SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
     if torch.cuda.get_device_capability(q.device)[0] >= 9:
         order[:2] = order[1::-1]
-    heads = lambda x: x.transpose(0, 1)[None]
     with sdpa_kernel(order, set_priority=True):
         o = F.scaled_dot_product_attention(heads(q), heads(k), heads(v), is_causal=True, scale=scale, enable_gqa=True)
     return o[0].transpose(0, 1)

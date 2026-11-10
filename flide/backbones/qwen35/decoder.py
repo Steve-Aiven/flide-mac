@@ -27,13 +27,33 @@ import torch
 
 from ... import lora
 from ...formats.base import FINAL
-from ...kernels.fla import pin_fla_size_buckets
+from ...kernels.backend import use_triton
+from ...runtime.device import empty_cache
 from ...runtime.pack import PackedBatch
 from ..base import Backbone
 from ...kernels import attention as attn_kernel
 from ...kernels.fp8 import mm, mm_into
 from .ops import add_rms, ffn, final_norm, gated_rms, last_qkv, merge, qk_norm_rope, rms, rows_ranges, swiglu
 from .ops import gate as gate_out
+
+
+def _pin_fla():
+    if use_triton():
+        from ...kernels.fla import pin_fla_size_buckets
+
+        pin_fla_size_buckets()
+
+
+def _gdn_ops(device):
+    """FLA (CUDA/Triton) or eager PyTorch (MPS/CPU) for causal_conv1d and chunk_gated_delta_rule."""
+    if use_triton(device):
+        from fla.modules.convolution import causal_conv1d
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+
+        return causal_conv1d, chunk_gated_delta_rule
+    from ...kernels import eager
+
+    return eager.causal_conv1d, eager.chunk_gated_delta_rule
 
 
 _FP8_RE = None
@@ -117,7 +137,7 @@ class Qwen35(Backbone):
 
                 logging.getLogger("flide.load").warning("direct load failed (%s); using transformers", exc)
                 model, store = None, ({} if lean_fp8 else None)
-                torch.cuda.empty_cache()
+                empty_cache(device)
         if model is None:
             store = None
             model = arch.from_pretrained(model_dir, config=cfg, dtype=getattr(torch, dtype),
@@ -141,7 +161,7 @@ class Qwen35(Backbone):
         p0 = next(causal_lm.parameters())
         self.device, self.dtype = p0.device, p0.dtype
         self.cuda_graphs = cuda_graphs
-        pin_fla_size_buckets()
+        _pin_fla()
         self.fp8 = False
         self.tp = tp if tp is not None and tp[1] > 1 else None
         if self.tp is not None:
@@ -222,7 +242,7 @@ class Qwen35(Backbone):
                 rows(m.k_proj, slice(hk.start * hd, hk.stop * hd))
                 rows(m.v_proj, slice(hk.start * hd, hk.stop * hd))
                 cols(m.o_proj, slice(hq.start * hd, hq.stop * hd))
-        torch.cuda.empty_cache()
+        empty_cache(self.device)
 
     def request_graphs(self):
         """CUDA graphs for one request at a time (graphs.py), built on first use; None without CUDA graphs."""
@@ -445,7 +465,7 @@ class Qwen35(Backbone):
             for mod in mods:
                 mod.weight.data = torch.empty(0, device=self.device, dtype=self.dtype)
         self.fp8 = True
-        torch.cuda.empty_cache()
+        empty_cache(self.device)
         return n
 
     @torch.inference_mode()
@@ -496,8 +516,7 @@ class Qwen35(Backbone):
         return out
 
     def _gated_delta_fused(self, m, w, x, b: PackedBatch):
-        from fla.modules.convolution import causal_conv1d
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+        causal_conv1d, chunk_gated_delta_rule = _gdn_ops(x.device)
 
         T, Tp = x.shape[0], b.n_prefix_tokens
         kd, vd, nv = m.key_dim, m.value_dim, m.num_v_heads
@@ -534,8 +553,7 @@ class Qwen35(Backbone):
         """Gated DeltaNet when prefixes resume from saved states or are cut at marks: one call per prefix level,
         each starting from the conv window and recurrent state (float32) the level before left, then the suffixes.
         States at the marks are saved into `b.saved`."""
-        from fla.modules.convolution import causal_conv1d
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+        causal_conv1d, chunk_gated_delta_rule = _gdn_ops(x.device)
 
         T, Tp, J = x.shape[0], b.n_prefix_tokens, b.n_jobs
         kd, vd, nv = m.key_dim, m.value_dim, m.num_v_heads

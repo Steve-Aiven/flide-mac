@@ -52,7 +52,10 @@ def check_cuda() -> None:
         return
     drv = driver_version()
     if drv is None:
-        raise RuntimeError("No NVIDIA driver is loaded, and flide's PyTorch path runs on NVIDIA GPUs.")
+        raise RuntimeError(
+            "No NVIDIA driver is loaded. On Apple Silicon use --device mps (or --device auto). "
+            "On Linux/Windows install an NVIDIA driver and a CUDA build of PyTorch."
+        )
     if torch.version.cuda is None:
         raise RuntimeError(f"PyTorch {torch.__version__} is a CPU build. Install a CUDA build: "
                            f"{torch_install(driver_cuda())}")
@@ -70,3 +73,16 @@ def check_cuda() -> None:
         reason = str(e).strip().splitlines()[0]
     runs = f" although the NVIDIA driver ({drv}) runs its CUDA {torch.version.cuda}" if have else ""
     raise RuntimeError(f"PyTorch {torch.__version__} cannot use the GPU{runs}: {reason}")
+
+
+def check_mps() -> None:
+    """Fail early when --device mps was asked for but this PyTorch build cannot use Metal."""
+    import torch
+
+    if not getattr(torch.backends, "mps", None) or not torch.backends.mps.is_available():
+        raise RuntimeError(
+            f"PyTorch {torch.__version__} cannot use MPS. Install a macOS arm64 build of PyTorch "
+            "on Apple Silicon (M1 or newer)."
+        )
+    # Probe a tiny tensor so a broken Metal runtime surfaces here.
+    torch.empty(1, device="mps")

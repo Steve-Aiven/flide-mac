@@ -1,8 +1,7 @@
-"""flide: inference for decision models. Read the input once, read answers where the model family
-says, never generate."""
+"""flide-mac: Flide fork with Apple Silicon (MPS) support for decision models."""
 from __future__ import annotations
 
-__version__ = "0.1.12"
+__version__ = "0.1.12+mac"
 
 
 def __getattr__(name):

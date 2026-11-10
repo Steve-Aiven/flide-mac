@@ -16,7 +16,9 @@
 
 <p align="center"><a href="#-news">News</a> · <a href="#quick-start">Quick start</a> · <a href="#models">Models</a> · <a href="#options">Options</a></p>
 
-[Flide](https://docs.flide.org) is fast inference infrastructure for Jev-style decision models. With exact state forking it is up to 9.5 times faster than vLLM and SGLang, and every answer is the one the model gives the question alone. It serves the Jev `/v1/systemone` API.
+**flide-mac** is a fork of [OmniJev/Flide](https://github.com/OmniJev/Flide) with **Apple Silicon (MPS)** support. See [MAC.md](MAC.md) for Mac install notes. Upstream Flide remains the CUDA-first project; this fork keeps the same `/v1/systemone` API.
+
+[Flide](https://docs.flide.org) is fast inference infrastructure for Jev-style decision models. With exact state forking it is up to 9.5 times faster than vLLM and SGLang on NVIDIA GPUs, and every answer is the one the model gives the question alone. It serves the Jev `/v1/systemone` API.
 
 <p align="center">
   <img alt="9.5 times faster than vLLM and SGLang; exact state forking; extremely fast" src="assets/highlights.svg" width="100%">
@@ -50,12 +52,12 @@
 
 ## Quick start
 
-See the [docs](https://docs.flide.org) for every model, images, the API and all options.
+See the [docs](https://docs.flide.org) for every model, images, the API and all options. On a Mac, prefer [MAC.md](MAC.md).
 
 ```bash
 uv venv -p 3.12 && source .venv/bin/activate
-uv pip install flide torchvision
-flide serve --model OmniJev/OneJev1.6-0.8B
+uv pip install -e . torchvision
+flide serve --model OmniJev/OneJev1.6-0.8B --device auto --host 127.0.0.1
 ```
 
 Any model in the [model table](#models) starts the same way, for example Perplexity's decision model.

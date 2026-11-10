@@ -159,7 +159,9 @@ class GemmaGraphs:
             log.warning("CUDA graph (gemma4, %d tokens) not captured (%s: %s); that length runs eagerly", L,
                         type(exc).__name__, str(exc)[:200])
             failed.add(L)
-            torch.cuda.empty_cache()
+            from ...runtime.device import empty_cache
+
+            empty_cache(self.bb.device)
             return False
         graphs[L] = g
         return True

@@ -72,8 +72,13 @@ def run(args) -> None:
 
         fronts = frontend.start(args.frontends, model_dir, family.name, _family_options(family, options), name,
                                 args.host, args.port, args.planners, args.access_log)
-    engine = Engine(model_dir, format=family.name, device=args.device, dtype=args.dtype,
-                    backbone_options={"cuda_graphs": not args.no_cuda_graphs, "quantize": args.quantize},
+    from ..runtime.device import is_cuda, resolve_device, resolve_dtype
+
+    device = resolve_device(args.device)
+    dtype = resolve_dtype(device, args.dtype)
+    use_graphs = (not args.no_cuda_graphs) and is_cuda(device)
+    engine = Engine(model_dir, format=family.name, device=device, dtype=dtype,
+                    backbone_options={"cuda_graphs": use_graphs, "quantize": args.quantize},
                     session_cache_gb=args.session_cache_gb, session_min_tokens=args.session_min_tokens,
                     batch_invariant=args.batch_invariant, **_family_options(family, options))
     from ..runtime.online import Batcher
@@ -93,8 +98,10 @@ def add_parser(sub) -> None:
     s.add_argument("--format-arg", action="append", metavar="KEY=VALUE", help="family option")
     s.add_argument("--name", default=None, help="model name reported by the API (default: from --model)")
     s.add_argument("--calibration", default=None, help="calibration.json (default: the one next to the weights)")
-    s.add_argument("--device", default="cuda:0")
-    s.add_argument("--dtype", default="bfloat16")
+    s.add_argument("--device", default="auto",
+                   help="cuda:N, mps, cpu, or auto (CUDA if present, else MPS on Apple Silicon)")
+    s.add_argument("--dtype", default="auto",
+                   help="bfloat16, float16, float32, or auto (bfloat16 on CUDA, float16 on MPS)")
     s.add_argument("--media-root", default=None,
                    help="directory that local media paths in requests resolve against (without it, only base64)")
     s.add_argument("--allow-media-urls", action="store_true",

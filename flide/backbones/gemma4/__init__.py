@@ -184,7 +184,9 @@ class Gemma4(Backbone):
 
                 logging.getLogger("flide.load").warning("direct load failed (%s); using transformers", exc)
                 model = None
-                torch.cuda.empty_cache()
+                from ...runtime.device import empty_cache
+
+                empty_cache(device)
         if model is None:
             if config.model_type == "gemma4_text":
                 arch = transformers.Gemma4ForCausalLM

@@ -6,17 +6,17 @@ and stays zero. Needs compute capability 8.9 or newer (Ada, Hopper, Blackwell).
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
 
 from .. import settings
+from .backend import use_triton
 
-FP8 = torch.float8_e4m3fn
+FP8 = getattr(torch, "float8_e4m3fn", None)
 FP8_MAX = 448.0
 
 
 def supported(device) -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability(device) >= (8, 9)
+    return (use_triton(device) and torch.cuda.is_available()
+            and torch.cuda.get_device_capability(device) >= (8, 9))
 
 
 def quantize_rows(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -26,25 +26,27 @@ def quantize_rows(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return (w.float() / scale).clamp(-FP8_MAX, FP8_MAX).to(FP8), scale
 
 
-@triton.jit
-def _quantize_tokens(X, Q, S, K, sx, sq, BLOCK: tl.constexpr):
-    row = tl.program_id(0).to(tl.int64)
-    amax = tl.zeros([BLOCK], tl.float32)
-    for k0 in range(0, K, BLOCK):
-        cols = k0 + tl.arange(0, BLOCK)
-        x = tl.load(X + row * sx + cols, mask=cols < K, other=0.0).to(tl.float32)
-        amax = tl.maximum(amax, tl.abs(x))
-    s = tl.maximum(tl.max(amax, 0), 1e-12) * (1.0 / 448.0)
-    tl.store(S + row, s)
-    for k0 in range(0, K, BLOCK):
-        cols = k0 + tl.arange(0, BLOCK)
-        x = tl.load(X + row * sx + cols, mask=cols < K, other=0.0).to(tl.float32)
-        q = tl.minimum(tl.maximum(tl.math.div_rn(x, s), -448.0), 448.0)
-        tl.store(Q + row * sq + cols, q.to(Q.dtype.element_ty), mask=cols < K)
-
-
 def quantize_tokens(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """(M, K) activations (unit stride along K) -> float8 [M, K] and a [M, 1] float32 scale per token."""
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _quantize_tokens(X, Q, S, K, sx, sq, BLOCK: tl.constexpr):
+        row = tl.program_id(0).to(tl.int64)
+        amax = tl.zeros([BLOCK], tl.float32)
+        for k0 in range(0, K, BLOCK):
+            cols = k0 + tl.arange(0, BLOCK)
+            xv = tl.load(X + row * sx + cols, mask=cols < K, other=0.0).to(tl.float32)
+            amax = tl.maximum(amax, tl.abs(xv))
+        scale = tl.maximum(tl.max(amax, 0), 1e-12) * (1.0 / 448.0)
+        tl.store(S + row, scale)
+        for k0 in range(0, K, BLOCK):
+            cols = k0 + tl.arange(0, BLOCK)
+            xv = tl.load(X + row * sx + cols, mask=cols < K, other=0.0).to(tl.float32)
+            qv = tl.minimum(tl.maximum(tl.math.div_rn(xv, scale), -448.0), 448.0)
+            tl.store(Q + row * sq + cols, qv.to(Q.dtype.element_ty), mask=cols < K)
+
     M, K = x.shape
     q = torch.empty(M, K, device=x.device, dtype=FP8)
     s = torch.empty(M, 1, device=x.device, dtype=torch.float32)

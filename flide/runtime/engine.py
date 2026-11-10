@@ -86,41 +86,49 @@ def eager_tokens(model_type: str, backbone) -> int | None:
     return 3072 if params >= 20e9 else 4096 if params >= 6e9 else None
 
 
-def _gib() -> tuple[float, float, float]:
+def _gib(device=None) -> tuple[float, float, float]:
     """GPU memory in GiB: allocated by torch, reserved by its caching allocator (graph pools included), used on the
     device by every process."""
-    import torch
+    from .device import mem_gib
 
-    if not torch.cuda.is_available():
-        return 0.0, 0.0, 0.0
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    free, total = torch.cuda.mem_get_info()
-    g = 2 ** 30
-    return torch.cuda.memory_allocated() / g, torch.cuda.memory_reserved() / g, (total - free) / g
+    return mem_gib(device)
 
 
 class Engine:
-    def __init__(self, model: str, format: str | None = None, device: str = "cuda:0", dtype: str = "bfloat16",
+    def __init__(self, model: str, format: str | None = None, device: str = "auto", dtype: str | None = None,
                  budget: int = 65536, backbone_options: dict | None = None, capture: bool | int = 4096,
                  session_cache_gb: float = 0.0, session_min_tokens: int = 2048, batch_invariant: bool = False,
                  **format_options):
         """`batch_invariant`: the batch-invariant products for every engine of the process (`settings`)."""
         if batch_invariant:
             settings.batch_invariant = True
-        from ..kernels import launcher
-        from .env import check_cuda
+        from ..kernels.backend import triton_available, use_triton
+        from .device import is_cuda, resolve_device, resolve_dtype
+        from .env import check_cuda, check_mps
 
-        if str(device).startswith("cuda"):
+        device = resolve_device(device)
+        dtype = resolve_dtype(device, dtype)
+        if is_cuda(device):
             check_cuda()
-        launcher.install()
-        from .kcache import cache_dir, no_bundle, seed, tune
+        elif str(device).startswith("mps"):
+            check_mps()
+        if use_triton(device) and triton_available():
+            from ..kernels import launcher
 
-        seed()
-        missing = no_bundle()
-        if missing:
-            log.info("no precompiled kernels ship for %s: kernels not yet in %s compile on first use, so the first start "
-                     "on this machine takes a few minutes and later ones read them from the cache", missing, cache_dir())
+            launcher.install()
+            from .kcache import cache_dir, no_bundle, seed, tune
+
+            seed()
+            missing = no_bundle()
+            if missing:
+                log.info("no precompiled kernels ship for %s: kernels not yet in %s compile on first use, so the first "
+                         "start on this machine takes a few minutes and later ones read them from the cache",
+                         missing, cache_dir())
+        else:
+            log.info("using eager PyTorch kernels on %s (no Triton/CUDA graphs)", device)
+
+            def tune():
+                return None
         t0 = time.perf_counter()
         self.model_dir = resolve_model(model)
         config = model_config(self.model_dir)
@@ -140,6 +148,9 @@ class Engine:
 
             self.backbone = tp.launch(config.model_type, self.model_dir, device, dtype, tp_size, options)
         else:
+            options = dict(options)
+            if not is_cuda(device):
+                options["cuda_graphs"] = False
             self.backbone = backbones.get(config.model_type).load(self.model_dir, device=device, dtype=dtype, **options)
         tune()
         needs = getattr(self.format, "attention", "causal")
@@ -215,8 +226,9 @@ class Engine:
             pass
         finally:
             self.sessions = saved
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        from .device import synchronize
+
+        synchronize(getattr(self.backbone, "device", None))
         log.info("packed path warmed up in %.1fs", time.perf_counter() - t0)
 
     def run_plans(self, plans: Sequence[Plan | None], budget: int | None = None,
@@ -265,6 +277,11 @@ class Engine:
             mb, groups, ys, done_ev = item
             if done_ev is not None:
                 done_ev.synchronize()
+            elif self.backbone.device.type != "cpu":
+                # MPS (and other non-CUDA devices) have no Event here; wait before reading host copies.
+                from .device import synchronize
+
+                synchronize(self.backbone.device)
             branch_rows: dict[int, dict[int, list]] = {}
             for g, y in zip(groups, ys):
                 rows = y.tolist()
@@ -283,7 +300,9 @@ class Engine:
             t0 = time.perf_counter()
             for mb in batches[len(batches) // 2: len(batches) // 2 + warmup]:
                 collect(launch(mb))
-            torch.cuda.synchronize()
+            from .device import synchronize
+
+            synchronize(self.backbone.device)
             if log_fn:
                 log_fn(f"warmup: {warmup} micro-batches in {time.perf_counter() - t0:.1f}s (not timed below)")
         t_start = time.perf_counter()
@@ -300,8 +319,9 @@ class Engine:
                 log_fn(f"forward {k + 1}/{len(batches)} micro-batches, {done / max(tokens, 1):.0%} of tokens")
         if pending is not None:
             collect(pending)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        from .device import synchronize
+
+        synchronize(self.backbone.device)
         stats = {"tokens": tokens, "micro_batches": len(batches), "forward_s": time.perf_counter() - t_start}
         return outputs, stats
 
@@ -310,7 +330,11 @@ class Engine:
 
     def _host(self, y, head):
         """Head outputs copied to the host without waiting, or left on the device for a head with `on_device`."""
-        return _Kept(y) if self._kept(head) else y.float().to("cpu", non_blocking=True)
+        if self._kept(head):
+            return _Kept(y)
+        # non_blocking CUDA copies are synced via Events in run_plans; MPS needs a blocking copy or an explicit sync.
+        non_blocking = y.device.type == "cuda"
+        return y.float().to("cpu", non_blocking=non_blocking)
 
     @staticmethod
     def _spots(plan: Plan):
@@ -691,8 +715,9 @@ class Engine:
                     ys[i] = y
             if ys:
                 copies = {i: self._host(y, plans[i].branch_reads(0)[0].head) for i, y in ys.items()}
-                done = torch.cuda.Event() if torch.cuda.is_available() else None
-                if done is not None:
+                done = None
+                if self.backbone.device.type == "cuda":
+                    done = torch.cuda.Event()
                     done.record()
                 copies = (copies, done, {i: self._counts(plans[i]) for i in ys})
                 for i in ys:

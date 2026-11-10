@@ -1,5 +1,7 @@
-"""Triton kernels. Importing this package routes Triton's run-time C builds through prebuilt modules
-(launcher.py), before any kernel here or in fla is compiled."""
-from .launcher import install as _install
+"""Kernels. On CUDA, route Triton's run-time C builds through prebuilt modules before compile."""
+from .backend import triton_available
 
-_install()
+if triton_available():
+    from .launcher import install as _install
+
+    _install()

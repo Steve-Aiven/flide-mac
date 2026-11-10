@@ -3,9 +3,9 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "flide"
+name = "flide-mac"
 version = "0.1.12"
-description = "Accelerating decision inference with exact state forking"
+description = "Flide fork with Apple Silicon (MPS) support for decision inference"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES"]
@@ -13,7 +13,7 @@ requires-python = ">=3.10"
 dependencies = [
     "torch>=2.12,<2.15",
     "transformers>=5.0",
-    "flash-linear-attention>=0.5.2,<0.7",
+    "flash-linear-attention>=0.5.2,<0.7; sys_platform != 'darwin'",
     "accelerate",
     "huggingface_hub",
     "pydantic>=2",
@@ -22,12 +22,17 @@ dependencies = [
     "uvicorn",
 ]
 
+[project.optional-dependencies]
+cuda = ["flash-linear-attention>=0.5.2,<0.7"]
+
 [project.scripts]
 flide = "flide.cli:main"
+flide-mac = "flide.cli:main"
 
 [project.urls]
-Homepage = "https://flide.org"
-Repository = "https://github.com/OmniJev/Flide"
+Homepage = "https://github.com/Steve-Aiven/flide-mac"
+Repository = "https://github.com/Steve-Aiven/flide-mac"
+Upstream = "https://github.com/OmniJev/Flide"
 
 [project.entry-points."flide.formats"]
 onejev = "flide_onejev:OneJev"

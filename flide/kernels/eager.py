@@ -30,12 +30,13 @@ def swiglu(gu, n: int):
 
 
 def gated_rms(o, z, w, eps: float):
+    """Match pointwise_triton: RMSNorm(o) * silu(z)."""
     T, H, DV = o.shape
     of = o.float()
     inv = torch.rsqrt(of.pow(2).mean(-1, keepdim=True) + eps)
     y = of * inv * w.float()
     zf = z.float().view(T, H, DV)
-    return (y * torch.sigmoid(zf)).to(o.dtype).view(T, H * DV)
+    return (y * zf * torch.sigmoid(zf)).to(o.dtype).view(T, H * DV)
 
 
 def norm_rope(x, cos, sin, w, eps: float):

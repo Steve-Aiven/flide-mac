@@ -8,7 +8,8 @@ This repository is a fork of [OmniJev/Flide](https://github.com/OmniJev/Flide) t
 - Default dtype `float16` on MPS (`bfloat16` remains the CUDA default)
 - Qwen3.5 / OneJev-style packed forwards on MPS via **Metal** kernels (`flide/kernels/metal/`) for Gated DeltaNet and causal conv, with vectorized SDPA for packed attention
 - Packed `cu_seqlens` GDN/conv run as **one Metal launch** across all segments (`gdn_recurrent_varlen`, `causal_conv1d_varlen_f16`)
-- Eager PyTorch fallbacks when Metal is unavailable
+- Metal pointwise for Qwen/OneJev: RMSNorm (+ residual), SwiGLU, gated RMS, norm+RoPE, attention gate (`float16`)
+- Eager PyTorch fallbacks when Metal is unavailable (Gemma sandwich/geglu stay eager on MPS)
 - Gemma 4 text path with CUDA graphs disabled
 - Images/video through eager vision helpers (slower than CUDA)
 
@@ -16,7 +17,8 @@ This repository is a fork of [OmniJev/Flide](https://github.com/OmniJev/Flide) t
 
 - No Triton / flash-linear-attention on Darwin (optional CUDA extra on Linux)
 - No CUDA graphs, FP8, NCCL tensor parallel, or shipped CUDA cubins
-- Latency is still below NVIDIA CUDA-graph numbers; Metal covers the GDN/conv hot path today (`torch.mps.compile_shader`), with more kernels (pointwise, custom attn) to follow
+- Latency is still below NVIDIA CUDA-graph numbers; Metal covers GDN/conv/pointwise today (`torch.mps.compile_shader`), with custom attn still optional
+
 
 ## Install (Apple Silicon)
 

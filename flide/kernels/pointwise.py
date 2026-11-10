@@ -1,10 +1,14 @@
-"""Row-wise kernels: Triton on CUDA, eager PyTorch on MPS/CPU."""
+"""Row-wise kernels: Triton on CUDA, Metal on MPS, eager PyTorch otherwise."""
 from __future__ import annotations
 
-from .backend import use_triton
+from .backend import use_metal, use_triton
 
 
 def rms_norm(x, w, eps: float, residual=None, offset: bool = True):
+    if use_metal(x.device):
+        from .metal import pointwise as m
+
+        return m.rms_norm(x, w, eps, residual=residual, offset=offset)
     if not use_triton(x.device):
         from . import eager
 
@@ -15,6 +19,10 @@ def rms_norm(x, w, eps: float, residual=None, offset: bool = True):
 
 
 def swiglu(gu, n: int):
+    if use_metal(gu.device):
+        from .metal import pointwise as m
+
+        return m.swiglu(gu, n)
     if not use_triton(gu.device):
         from . import eager
 
@@ -25,6 +33,10 @@ def swiglu(gu, n: int):
 
 
 def gated_rms(o, z, w, eps: float):
+    if use_metal(o.device):
+        from .metal import pointwise as m
+
+        return m.gated_rms(o, z, w, eps)
     if not use_triton(o.device):
         from . import eager
 
@@ -35,6 +47,10 @@ def gated_rms(o, z, w, eps: float):
 
 
 def qk_norm_rope(q, k, cos, sin, wq, wk, eps: float):
+    if use_metal(q.device):
+        from .metal import pointwise as m
+
+        return m.qk_norm_rope(q, k, cos, sin, wq, wk, eps)
     if not use_triton(q.device):
         from . import eager
 
@@ -45,6 +61,10 @@ def qk_norm_rope(q, k, cos, sin, wq, wk, eps: float):
 
 
 def norm_rope(x, cos, sin, w, eps: float):
+    if use_metal(x.device):
+        from .metal import pointwise as m
+
+        return m.norm_rope(x, cos, sin, w, eps)
     if not use_triton(x.device):
         from . import eager
 
@@ -55,6 +75,10 @@ def norm_rope(x, cos, sin, w, eps: float):
 
 
 def gate(o, g):
+    if use_metal(o.device):
+        from .metal import pointwise as m
+
+        return m.gate(o, g)
     if not use_triton(o.device):
         from . import eager
 
@@ -65,6 +89,7 @@ def gate(o, g):
 
 
 def gemma_norm_rope(x, cos, sin, w, eps: float):
+    # Gemma path stays eager on MPS for now (Qwen/OneJev is the Metal focus).
     if not use_triton(x.device):
         from . import eager
 

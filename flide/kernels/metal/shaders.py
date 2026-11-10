@@ -242,4 +242,178 @@ kernel void gdn_recurrent_varlen(
         threadgroup_barrier(mem_flags::mem_device);
     }
 }
+
+// ---- Pointwise (Qwen3.5 / OneJev hot path). Arithmetic in float32, store half. ----
+
+// y = RMSNorm(x); optional residual add stores h = (x+res) rounded to half first (matches Triton/eager).
+// x,y,h,res: [T, N] row-major half; w: [N] half. One threadgroup per row.
+kernel void rms_norm_f16(
+    device const half* x   [[buffer(0)]],
+    device const half* res [[buffer(1)]],
+    device const half* w   [[buffer(2)]],
+    device       half* h   [[buffer(3)]],
+    device       half* y   [[buffer(4)]],
+    constant int& T        [[buffer(5)]],
+    constant int& N        [[buffer(6)]],
+    constant float& eps    [[buffer(7)]],
+    constant int& has_res  [[buffer(8)]],
+    constant int& offset   [[buffer(9)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tg   [[threads_per_threadgroup]])
+{
+    int row = tgid;
+    if (row >= T) return;
+    threadgroup float partial[256];
+    device const half* xr = x + row * N;
+    float local = 0.0f;
+    if (has_res) {
+        device const half* rr = res + row * N;
+        device half* hr = h + row * N;
+        for (uint i = tid; i < (uint)N; i += tg) {
+            half hv = half(float(xr[i]) + float(rr[i]));
+            hr[i] = hv;
+            float v = float(hv);
+            local += v * v;
+        }
+    } else {
+        for (uint i = tid; i < (uint)N; i += tg) {
+            float v = float(xr[i]);
+            local += v * v;
+        }
+    }
+    partial[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg / 2; s > 0; s >>= 1) {
+        if (tid < s) partial[tid] += partial[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = rsqrt(partial[0] / float(N) + eps);
+    device half* yr = y + row * N;
+    if (has_res) {
+        device half* hr = h + row * N;
+        for (uint i = tid; i < (uint)N; i += tg) {
+            float ww = float(w[i]);
+            if (offset) ww = 1.0f + ww;
+            yr[i] = half(float(hr[i]) * inv * ww);
+        }
+    } else {
+        for (uint i = tid; i < (uint)N; i += tg) {
+            float ww = float(w[i]);
+            if (offset) ww = 1.0f + ww;
+            yr[i] = half(float(xr[i]) * inv * ww);
+        }
+    }
+}
+
+// out = silu(gu[:, :n]) * gu[:, n:]; gu [T, 2n], out [T, n].
+kernel void swiglu_f16(
+    device const half* gu [[buffer(0)]],
+    device       half* out [[buffer(1)]],
+    constant int& T        [[buffer(2)]],
+    constant int& N        [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    int col = gid.x;
+    int row = gid.y;
+    if (row >= T || col >= N) return;
+    float a = float(gu[row * (2 * N) + col]);
+    float b = float(gu[row * (2 * N) + N + col]);
+    float s = a / (1.0f + exp(-a));
+    out[row * N + col] = half(s * b);
+}
+
+// o [T, H, DV], z [T, H*DV], w [DV] -> out [T, H*DV]: RMSNorm(o)*silu(z).
+kernel void gated_rms_f16(
+    device const half* o [[buffer(0)]],
+    device const half* z [[buffer(1)]],
+    device const half* w [[buffer(2)]],
+    device       half* out [[buffer(3)]],
+    constant int& T        [[buffer(4)]],
+    constant int& H        [[buffer(5)]],
+    constant int& DV       [[buffer(6)]],
+    constant float& eps    [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    int h = gid.x;
+    int t = gid.y;
+    if (t >= T || h >= H) return;
+    device const half* orow = o + (t * H + h) * DV;
+    float sumsq = 0.0f;
+    for (int i = 0; i < DV; i++) {
+        float v = float(orow[i]);
+        sumsq += v * v;
+    }
+    float inv = rsqrt(sumsq / float(DV) + eps);
+    int base = t * (H * DV) + h * DV;
+    for (int i = 0; i < DV; i++) {
+        float y = float(orow[i]) * inv * float(w[i]);
+        float zv = float(z[base + i]);
+        float sg = zv / (1.0f + exp(-zv));
+        out[base + i] = half(y * sg);
+    }
+}
+
+// Per-head RMSNorm (weight 1+w) then partial RoPE on first R dims.
+// x [T, Heads, HD], cos/sin [T, R], w [HD], out [T, Heads, HD].
+kernel void norm_rope_f16(
+    device const half* x   [[buffer(0)]],
+    device const half* cos [[buffer(1)]],
+    device const half* sin [[buffer(2)]],
+    device const half* w   [[buffer(3)]],
+    device       half* out [[buffer(4)]],
+    constant int& T        [[buffer(5)]],
+    constant int& Heads    [[buffer(6)]],
+    constant int& HD       [[buffer(7)]],
+    constant int& R        [[buffer(8)]],
+    constant float& eps    [[buffer(9)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    int h = gid.x;
+    int t = gid.y;
+    if (t >= T || h >= Heads) return;
+    device const half* xr = x + (t * Heads + h) * HD;
+    device half* yr = out + (t * Heads + h) * HD;
+    float sumsq = 0.0f;
+    for (int i = 0; i < HD; i++) {
+        float v = float(xr[i]);
+        sumsq += v * v;
+    }
+    float inv = rsqrt(sumsq / float(HD) + eps);
+    int half_r = R / 2;
+    for (int i = 0; i < HD; i++) {
+        float yi = float(xr[i]) * inv * (1.0f + float(w[i]));
+        if (i < R) {
+            int partner = (i < half_r) ? (i + half_r) : (i - half_r);
+            float yp = float(xr[partner]) * inv * (1.0f + float(w[partner]));
+            float c = float(cos[t * R + i]);
+            float s = float(sin[t * R + i]);
+            float sign = (i < half_r) ? -1.0f : 1.0f;
+            yi = yi * c + sign * yp * s;
+        }
+        yr[i] = half(yi);
+    }
+}
+
+// out[t, h*HD + d] = o[t,h,d] * sigmoid(g[t,h,d]); contiguous last dim assumed after pack.
+kernel void gate_f16(
+    device const half* o [[buffer(0)]],
+    device const half* g [[buffer(1)]],
+    device       half* out [[buffer(2)]],
+    constant int& T        [[buffer(3)]],
+    constant int& H        [[buffer(4)]],
+    constant int& HD       [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    int h = gid.x;
+    int t = gid.y;
+    if (t >= T || h >= H) return;
+    int oh = (t * H + h) * HD;
+    int oo = t * (H * HD) + h * HD;
+    for (int i = 0; i < HD; i++) {
+        float gv = float(g[oh + i]);
+        float sg = 1.0f / (1.0f + exp(-gv));
+        out[oo + i] = half(float(o[oh + i]) * sg);
+    }
+}
 """
